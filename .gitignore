@@ -1,0 +1,9 @@
+# Build outputs
+*.o
+AITouchBar
+AITouchBar.app/
+
+# macOS system files
+.DS_Store
+*.swp
+*~
