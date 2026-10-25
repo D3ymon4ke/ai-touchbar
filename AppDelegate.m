@@ -22,6 +22,7 @@ typedef void (*DFRElementSetControlStripPresenceForIdentifierFunc)(NSString *ide
 @property (nonatomic, strong) AIUsageSnapshot *currentSnapshot;
 @property (nonatomic, strong) TouchBarGaugeView *gaugeView;
 @property (nonatomic, assign) DFRElementSetControlStripPresenceForIdentifierFunc setPresenceFunc;
+@property (nonatomic, assign) BOOL isDisplayActive;
 @end
 
 @implementation AppDelegate
@@ -36,34 +37,133 @@ typedef void (*DFRElementSetControlStripPresenceForIdentifierFunc)(NSString *ide
     // 2. Primeira leitura de dados da IA
     self.currentSnapshot = [[AIUsageReader sharedReader] fetchCurrentSnapshot];
     
-    // 3. Configurar Menu Bar Item (NSStatusItem)
-    [self setupMenuBarItem];
-    
-    // 4. Configurar Touch Bar Modal Controller
+    // 3. Configurar Touch Bar Modal Controller
     self.modalController = [[TouchBarModalController alloc] initWithSnapshot:self.currentSnapshot];
     self.modalController.delegate = self;
     
-    // 5. Configurar Widget na Touch Bar (Control Strip)
+    // 4. Registrar observadores do NSWorkspace para acompanhar abertura/fechamento do Antigravity
+    NSNotificationCenter *wsCenter = [[NSWorkspace sharedWorkspace] notificationCenter];
+    [wsCenter addObserver:self
+                 selector:@selector(handleAppLaunched:)
+                     name:NSWorkspaceDidLaunchApplicationNotification
+                   object:nil];
+    [wsCenter addObserver:self
+                 selector:@selector(handleAppTerminated:)
+                     name:NSWorkspaceDidTerminateApplicationNotification
+                   object:nil];
+    
+    // 5. Verificar se o Antigravity já está aberto agora
+    if ([self isAntigravityRunning]) {
+        [self showOnTouchBarAndMenuBar];
+    } else {
+        NSLog(@"[AITouchBar] Antigravity IDE não está aberto no momento. Aguardando inicialização...");
+        self.isDisplayActive = NO;
+    }
+}
+
+- (BOOL)isAntigravityRunning {
+    for (NSRunningApplication *app in [[NSWorkspace sharedWorkspace] runningApplications]) {
+        NSString *bid = [app.bundleIdentifier lowercaseString];
+        NSString *name = [app.localizedName lowercaseString];
+        if ([bid containsString:@"antigravity"] || [name containsString:@"antigravity"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (BOOL)isAntigravityApp:(NSRunningApplication *)app {
+    NSString *bid = [app.bundleIdentifier lowercaseString];
+    NSString *name = [app.localizedName lowercaseString];
+    return ([bid containsString:@"antigravity"] || [name containsString:@"antigravity"]);
+}
+
+- (void)handleAppLaunched:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    if ([self isAntigravityApp:app]) {
+        NSLog(@"[AITouchBar] Antigravity IDE iniciado (%@). Ativando Touch Bar...", app.localizedName);
+        // Aguarda 1.5s para os serviços internos e o Language Server inicializarem
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self showOnTouchBarAndMenuBar];
+        });
+    }
+}
+
+- (void)handleAppTerminated:(NSNotification *)notification {
+    NSRunningApplication *app = notification.userInfo[NSWorkspaceApplicationKey];
+    if ([self isAntigravityApp:app]) {
+        // Se ainda houver outra instância de Antigravity aberta, mantém
+        if (![self isAntigravityRunning]) {
+            NSLog(@"[AITouchBar] Antigravity IDE encerrou. Ocultando da Touch Bar e Menu Bar...");
+            [self hideFromTouchBarAndMenuBar];
+        }
+    }
+}
+
+- (void)showOnTouchBarAndMenuBar {
+    if (self.isDisplayActive) {
+        [self refreshData];
+        return;
+    }
+    self.isDisplayActive = YES;
+    
+    // Iniciar Menu Bar
+    if (!self.statusItem) {
+        [self setupMenuBarItem];
+    } else {
+        self.statusItem.visible = YES;
+        [self updateMenuBarUI];
+    }
+    
+    // Iniciar Control Strip na Touch Bar
     [self setupTouchBarControlStrip];
     
-    // 6. Iniciar Timer de Atualização Automática (a cada 10s)
+    // Iniciar timer de 10s
+    [self.refreshTimer invalidate];
     self.refreshTimer = [NSTimer scheduledTimerWithTimeInterval:10.0
                                                          target:self
                                                        selector:@selector(refreshData)
                                                        userInfo:nil
                                                         repeats:YES];
+    [self refreshData];
+    NSLog(@"[AITouchBar] Ativado na Touch Bar com sucesso.");
+}
+
+- (void)hideFromTouchBarAndMenuBar {
+    if (!self.isDisplayActive) return;
+    self.isDisplayActive = NO;
     
-    NSLog(@"[AITouchBar] Inicializado com sucesso. Modelo: %@ | Restante: %.0f%%",
-          self.currentSnapshot.modelName, self.currentSnapshot.remainingPercent);
+    // Fechar modal se estiver aberto
+    [self touchBarDidRequestClose];
+    
+    // Remover da Touch Bar
+    if (self.setPresenceFunc) {
+        self.setPresenceFunc(kControlStripId, NO);
+    }
+    if (self.controlStripItem && [NSTouchBarItem respondsToSelector:@selector(removeSystemTrayItem:)]) {
+        [NSTouchBarItem removeSystemTrayItem:self.controlStripItem];
+        self.controlStripItem = nil;
+        self.gaugeView = nil;
+    }
+    
+    // Ocultar da Menu Bar
+    if (self.statusItem) {
+        self.statusItem.visible = NO;
+    }
+    
+    // Pausar timer
+    [self.refreshTimer invalidate];
+    self.refreshTimer = nil;
 }
 
 - (void)setupMenuBarItem {
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    self.statusItem.visible = YES;
     [self updateMenuBarUI];
 }
 
 - (void)updateMenuBarUI {
-    if (!self.statusItem) return;
+    if (!self.statusItem || !self.statusItem.isVisible) return;
     
     NSStatusBarButton *button = self.statusItem.button;
     if (button) {
@@ -156,6 +256,13 @@ typedef void (*DFRElementSetControlStripPresenceForIdentifierFunc)(NSString *ide
         return;
     }
     
+    if (self.controlStripItem) {
+        if (self.setPresenceFunc) {
+            self.setPresenceFunc(kControlStripId, YES);
+        }
+        return;
+    }
+    
     self.controlStripItem = [[NSCustomTouchBarItem alloc] initWithIdentifier:kControlStripId];
     
     self.gaugeView = [[TouchBarGaugeView alloc] initWithSnapshot:self.currentSnapshot];
@@ -179,6 +286,8 @@ typedef void (*DFRElementSetControlStripPresenceForIdentifierFunc)(NSString *ide
 }
 
 - (void)refreshData {
+    if (!self.isDisplayActive) return;
+    
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         AIUsageSnapshot *newSnapshot = [[AIUsageReader sharedReader] fetchCurrentSnapshot];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -207,12 +316,7 @@ typedef void (*DFRElementSetControlStripPresenceForIdentifierFunc)(NSString *ide
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
-    if (self.setPresenceFunc) {
-        self.setPresenceFunc(kControlStripId, NO);
-    }
-    if (self.controlStripItem && [NSTouchBarItem respondsToSelector:@selector(removeSystemTrayItem:)]) {
-        [NSTouchBarItem removeSystemTrayItem:self.controlStripItem];
-    }
+    [self hideFromTouchBarAndMenuBar];
 }
 
 @end
